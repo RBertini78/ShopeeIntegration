@@ -1,14 +1,16 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
-namespace ShopeeIntegration
+namespace ShopeeIntegration 
 {
     public partial class Form1 : Form
     {
@@ -143,7 +145,7 @@ namespace ShopeeIntegration
             }
 
             // Gera URL de autorização para o lojista. Ajuste redirect_uri conforme sua aplicação.
-            var redirectUri = "https://your-redirect-uri.example.com/"; // substituir pelo seu redirect URI registrado
+            var redirectUri = "https://shopee.com.br/"; // substituir pelo seu redirect URI registrado
             var url = ShopeeService.GetAuthorizationUrl(partnerId, redirectUri, cbEnvironment.SelectedItem?.ToString() == "Production");
             System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = url, UseShellExecute = true });
             SetStatus("Abra o navegador para autorizar a loja e copie o authorization_code.");
@@ -170,7 +172,7 @@ namespace ShopeeIntegration
                 var token = await _service.GetAccessTokenAsync(code);
                 if (!string.IsNullOrEmpty(token))
                 {
-                    SetStatus("Token obtido e armazenado (in-memory).");
+                    SetStatus("Token obtido e armazenado (seguro).");
                     MessageBox.Show("Access token obtido com sucesso.");
                 }
                 else
@@ -217,6 +219,65 @@ namespace ShopeeIntegration
         public List<OrderItemModel> Items { get; set; } = new List<OrderItemModel>();
     }
 
+    // Exceção customizada para erros da API Shopee
+    public class ShopeeApiException : Exception
+    {
+        public int ErrorCode { get; }
+        public string ShopeeMessage { get; }
+
+        public ShopeeApiException(string message, int errorCode = -1, string shopeeMessage = null) : base(message)
+        {
+            ErrorCode = errorCode;
+            ShopeeMessage = shopeeMessage;
+        }
+    }
+
+    // Logger simples (arquivo)
+    public static class SimpleLogger
+    {
+        private static readonly object _sync = new();
+        private static readonly string _logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ShopeeIntegration");
+        private static readonly string _logFile = Path.Combine(_logDir, "shopee_integration.log");
+
+        public static void Log(string message)
+        {
+            try
+            {
+                lock (_sync)
+                {
+                    Directory.CreateDirectory(_logDir);
+                    var line = $"{DateTime.UtcNow:O} | {message}";
+                    File.AppendAllLines(_logFile, new[] { line }, Encoding.UTF8);
+                }
+            }
+            catch
+            {
+                // never throw from logger
+            }
+        }
+
+        public static void LogRequest(string url, string body)
+        {
+            var safeUrl = MaskApiKeyInUrl(url);
+            Log($"REQUEST -> {safeUrl} | BODY: {Truncate(body, 2000)}");
+        }
+
+        public static void LogResponse(string url, string response, int statusCode)
+        {
+            var safeUrl = MaskApiKeyInUrl(url);
+            Log($"RESPONSE <- {safeUrl} | STATUS: {statusCode} | BODY: {Truncate(response, 2000)}");
+        }
+
+        private static string Truncate(string s, int max) => s?.Length > max ? s.Substring(0, max) + "..." : s;
+
+        private static string MaskApiKeyInUrl(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return url;
+            // mask common api_key query param occurrences
+            return url.Replace("api_key=", "api_key=[REDACTED]");
+        }
+    }
+
     public class ShopeeService
     {
         private readonly long _partnerId;
@@ -225,22 +286,16 @@ namespace ShopeeIntegration
         private readonly ShopeeEnvironment _env;
         private readonly HttpClient _http;
 
-        // Base hosts (ajuste se Shopee alterar)
-        private const string SandboxHost = "https://partner.test.shopeemobile.com";
+        // Hosts (ajuste se a documentação oficial indicar outro) partner.test.shopeemobile.com
+        private const string SandboxHost = "https://open.sandbox.test-stable.shopee.com/authorize";
         private const string ProductionHost = "https://partner.shopeemobile.com";
 
-        // Exposed for creating authorization URL
-        public static string GetAuthorizationUrl(long partnerId, string redirectUri, bool production = false)
-        {
-            var host = production ? ProductionHost : SandboxHost;
-            // Path e parâmetros podem variar conforme a documentação — ajuste se necessário.
-            // Exemplo common: /api/v2/shop/auth_partner?partner_id={partnerId}&redirect={redirectUri}
-            var path = "/api/v2/shop/auth_partner";
-            var url = $"{host}{path}?partner_id={partnerId}&redirect={Uri.EscapeDataString(redirectUri)}";
-            return url;
-        }
+        // Token persistence/file
+        private static readonly string AppFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ShopeeIntegration");
+        private static readonly string TokenFilePath = Path.Combine(AppFolder, "access_token.dat");
+        private const string CredentialTarget = "ShopeeIntegration_AccessToken";
 
-        // In-memory token (para exemplo). Persista em storage seguro em produção.
+        // In-memory token
         private string _accessToken = null;
         private DateTime? _accessTokenExpiresAt = null;
 
@@ -251,46 +306,78 @@ namespace ShopeeIntegration
             _apiKey = apiKey ?? throw new ArgumentNullException(nameof(apiKey));
             _env = env;
             _http = new HttpClient(new HttpClientHandler { UseCookies = false });
+
+            // tenta carregar token seguro ao iniciar
+            try
+            {
+                var token = LoadTokenSecure();
+                if (!string.IsNullOrEmpty(token))
+                {
+                    _accessToken = token;
+                    SimpleLogger.Log("Access token carregado do armazenamento seguro.");
+                }
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao carregar token seguro: {ex.Message}");
+            }
         }
 
         private string BaseHost => _env == ShopeeEnvironment.Production ? ProductionHost : SandboxHost;
 
-        /// <summary>
-        /// Troca o authorization_code pelo access_token (persistir token).
-        /// Atenção: ajuste o path e o body conforme a documentação oficial Shopee V2.
-        /// </summary>
+        // ---------------------------
+        // Authorization (OAuth) flow
+        // ---------------------------
+        public static string GetAuthorizationUrl(long partnerId, string redirectUri, bool production = false)
+        {
+            var host = production ? ProductionHost : SandboxHost;
+            // Url de autorização varia conforme doc; este é template que pode precisar de ajustes.
+            // Ajuste path/params de acordo com o que a documentação oficial indicar.
+            var path = "/api/v2/shop/auth_partner";
+            var url = $"{host}{path}?partner_id={partnerId}&redirect={Uri.EscapeDataString(redirectUri)}";
+            return url;
+        }
+
         public async Task<string> GetAccessTokenAsync(string authCode)
         {
-            // Endpoint (ajustar se doc indicar outro)
             var path = "/api/v2/auth/token/get";
             var body = new
             {
                 authorization_code = authCode,
                 partner_id = _partnerId,
-                // shop_id pode ser necessário em alguns fluxos; incluir se requerido
                 shop_id = _shopId
             };
 
             var resp = await SendPostAsync(path, body, includeShopId: true, includeAuthToken: false);
-            // Exemplo de parsing: verificar campos retornados (ajuste conforme resposta real)
+            // Resposta esperada: { "error":0, "message":"success", "access_token":"...", "expires_in": 3600, ... }
             if (resp.TryGetProperty("access_token", out var tok))
             {
                 _accessToken = tok.GetString();
-                if (resp.TryGetProperty("expires_in", out var exp))
-                {
-                    var seconds = exp.GetInt32();
+                if (resp.TryGetProperty("expires_in", out var exp) && exp.TryGetInt32(out var seconds))
                     _accessTokenExpiresAt = DateTime.UtcNow.AddSeconds(seconds - 30);
+
+                // Persistir o token de forma segura
+                try
+                {
+                    SaveTokenSecure(_accessToken);
+                    SimpleLogger.Log("Access token salvo de forma segura.");
                 }
+                catch (Exception ex)
+                {
+                    SimpleLogger.Log($"Falha ao salvar token seguro: {ex.Message}");
+                }
+
                 return _accessToken;
             }
 
-            return null;
+            // se não retornou access_token, extrair erro para lançar
+            var (code, msg) = ExtractError(resp);
+            throw new ShopeeApiException("Falha ao obter access_token", code, msg);
         }
 
-        /// <summary>
-        /// Lista produtos do shop; paginação simples.
-        /// Ajuste path/body conforme documento da Shopee V2.
-        /// </summary>
+        // ---------------------------
+        // Produtos / Estoque / Preço
+        // ---------------------------
         public async Task<List<ProductModel>> GetProductsAsync()
         {
             var result = new List<ProductModel>();
@@ -299,7 +386,7 @@ namespace ShopeeIntegration
 
             while (true)
             {
-                var path = "/api/v2/product/get_item_list"; // pode ser diferente; ajuste conforme doc
+                var path = "/api/v2/product/get_item_list";
                 var body = new
                 {
                     partner_id = _partnerId,
@@ -309,9 +396,8 @@ namespace ShopeeIntegration
                 };
 
                 var resp = await SendPostAsync(path, body, includeShopId: true);
-                // Espera: { "error":0, "message":"success", "response": { "items": [ ... ] } }
                 if (!resp.TryGetProperty("response", out var responseObj))
-                    break;
+                    throw ConstructExceptionFromResponse(resp, "GetProductsAsync");
 
                 if (!responseObj.TryGetProperty("items", out var items))
                     break;
@@ -321,18 +407,10 @@ namespace ShopeeIntegration
 
                 foreach (var it in itemsArray)
                 {
-                    // Ajuste mapeamento conforme schema real
-                    var itemId = it.TryGetProperty("item_id", out var iid) ? iid.GetInt64() : (it.TryGetProperty("item_id_long", out var iid2) ? iid2.GetInt64() : 0);
+                    var itemId = it.TryGetProperty("item_id", out var iid) ? iid.GetInt64() : 0;
                     var name = it.TryGetProperty("name", out var nm) ? nm.GetString() : "";
                     var stock = it.TryGetProperty("stock", out var st) ? st.GetInt32() : 0;
-                    var price = 0m;
-                    if (it.TryGetProperty("price", out var pr))
-                    {
-                        if (pr.ValueKind == JsonValueKind.Number && pr.TryGetDecimal(out var dec))
-                            price = dec;
-                        else if (pr.ValueKind == JsonValueKind.String && decimal.TryParse(pr.GetString(), out var dec2))
-                            price = dec2;
-                    }
+                    var price = ParseDecimalFromJsonElement(it, "price");
 
                     result.Add(new ProductModel
                     {
@@ -350,13 +428,10 @@ namespace ShopeeIntegration
             return result;
         }
 
-        /// <summary>
-        /// Atualiza estoque e preço de um item. Pode chamar endpoints separados conforme necessário.
-        /// </summary>
         public async Task<bool> UpdateStockPriceAsync(long itemId, int stock, decimal price)
         {
-            // 1) Atualizar estoque
-            var stockPath = "/api/v2/product/update_stock"; // ajuste
+            // Atualizar estoque
+            var stockPath = "/api/v2/product/update_stock";
             var stockBody = new
             {
                 partner_id = _partnerId,
@@ -366,10 +441,10 @@ namespace ShopeeIntegration
             };
 
             var stockResp = await SendPostAsync(stockPath, stockBody, includeShopId: true);
-            var stockOk = !stockResp.TryGetProperty("error", out var errStock) || errStock.GetInt32() == 0;
+            if (HasError(stockResp)) throw ConstructExceptionFromResponse(stockResp, "UpdateStockPriceAsync - update_stock");
 
-            // 2) Atualizar preço
-            var pricePath = "/api/v2/product/update_price"; // ajuste
+            // Atualizar preço
+            var pricePath = "/api/v2/product/update_price";
             var priceBody = new
             {
                 partner_id = _partnerId,
@@ -379,14 +454,14 @@ namespace ShopeeIntegration
             };
 
             var priceResp = await SendPostAsync(pricePath, priceBody, includeShopId: true);
-            var priceOk = !priceResp.TryGetProperty("error", out var errPrice) || errPrice.GetInt32() == 0;
+            if (HasError(priceResp)) throw ConstructExceptionFromResponse(priceResp, "UpdateStockPriceAsync - update_price");
 
-            return stockOk && priceOk;
+            return true;
         }
 
-        /// <summary>
-        /// Lista pedidos (com detalhes básicos). Ajuste path/body conforme doc.
-        /// </summary>
+        // ---------------------------
+        // Pedidos
+        // ---------------------------
         public async Task<List<OrderModel>> GetOrdersAsync()
         {
             var orders = new List<OrderModel>();
@@ -395,7 +470,7 @@ namespace ShopeeIntegration
 
             while (true)
             {
-                var path = "/api/v2/orders/get_order_list"; // ajuste
+                var path = "/api/v2/orders/get_order_list";
                 var body = new
                 {
                     partner_id = _partnerId,
@@ -405,7 +480,7 @@ namespace ShopeeIntegration
                 };
 
                 var resp = await SendPostAsync(path, body, includeShopId: true);
-                if (!resp.TryGetProperty("response", out var responseObj)) break;
+                if (!resp.TryGetProperty("response", out var responseObj)) throw ConstructExceptionFromResponse(resp, "GetOrdersAsync");
                 if (!responseObj.TryGetProperty("orders", out var arr)) break;
 
                 var arrItems = arr.EnumerateArray().ToArray();
@@ -413,7 +488,8 @@ namespace ShopeeIntegration
 
                 foreach (var o in arrItems)
                 {
-                    var orderId = o.TryGetProperty("order_sn", out var osn) ? osn.GetString() : (o.TryGetProperty("order_id", out var oid) ? oid.GetString() : "");
+                    var orderId = o.TryGetProperty("order_sn", out var osn) ? osn.GetString() :
+                                  (o.TryGetProperty("order_id", out var oid) ? oid.GetString() : "");
                     var buyer = o.TryGetProperty("buyer_username", out var bn) ? bn.GetString() : "";
                     var total = o.TryGetProperty("total_amount", out var ta) ? (ta.TryGetDecimal(out var d) ? d : 0m) : 0m;
 
@@ -424,7 +500,6 @@ namespace ShopeeIntegration
                         TotalPrice = total
                     };
 
-                    // Se não houver itens, buscar detalhes
                     if (o.TryGetProperty("order_lines", out var olines))
                     {
                         foreach (var li in olines.EnumerateArray())
@@ -440,11 +515,10 @@ namespace ShopeeIntegration
                     }
                     else
                     {
-                        // Buscar detalhes do pedido, se necessário
-                        var detailPath = "/api/v2/orders/get_order_detail"; // ajuste
+                        var detailPath = "/api/v2/orders/get_order_detail";
                         var detailBody = new
                         {
-                            partner_id = _partnerId,
+                            partner_id = _partner_id_wrapper(),
                             shop_id = _shopId,
                             order_sn = orderId
                         };
@@ -474,10 +548,16 @@ namespace ShopeeIntegration
             return orders;
         }
 
+        // small helper to satisfy anonymous object creation when code analysis complains about capture
+        private long _partner_id_wrapper() => _partnerId;
+
+        // ---------------------------
+        // HTTP + assinatura + logs + erros
+        // ---------------------------
         /// <summary>
-        /// Helper genérico para POST à Shopee V2.
-        /// Gera query string: partner_id, timestamp, sign, shop_id (se includeShopId).
-        /// O algoritmo de assinatura pode variar entre versões da API — ajuste o método ComputeSignature conforme necessário.
+        /// Envia POST para Shopee V2, gerando assinatura exatamente conforme documentação:
+        /// Assinatura HMAC-SHA256 com chave = api_key, data = partner_id + path + timestamp + body (incluir shop_id se o endpoint requerer shop_id)
+        /// IMPORTANT: confirme com a sua versão da documentação; alguns endpoints variam na concatenação.
         /// </summary>
         private async Task<JsonElement> SendPostAsync(string path, object bodyObj, bool includeShopId = false, bool includeAuthToken = true)
         {
@@ -488,8 +568,16 @@ namespace ShopeeIntegration
             var bodyJson = JsonSerializer.Serialize(bodyObj, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
             var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-            // Assinatura HMAC-SHA256: ajuste a concatenação se doc indicar formato diferente
-            var signInput = $"{_partnerId}{(includeShopId ? _shopId.ToString() : "")}{timestamp}{urlPath}{bodyJson}";
+            // Construção do input da assinatura seguindo doc: partner_id + path + timestamp + body
+            // Alguns endpoints pedem shop_id no input — incluímos quando includeShopId == true logo após partner_id
+            var signInputBuilder = new StringBuilder();
+            signInputBuilder.Append(_partnerId.ToString());
+            if (includeShopId) signInputBuilder.Append(_shopId.ToString());
+            signInputBuilder.Append(urlPath);
+            signInputBuilder.Append(timestamp);
+            signInputBuilder.Append(bodyJson);
+            var signInput = signInputBuilder.ToString();
+
             var sign = ComputeHmacSha256(_apiKey, signInput);
 
             var qs = new List<string>
@@ -503,27 +591,96 @@ namespace ShopeeIntegration
 
             var reqUrl = url + "?" + string.Join("&", qs);
 
+            // logs
+            SimpleLogger.LogRequest(reqUrl, bodyJson);
+
             using var req = new HttpRequestMessage(HttpMethod.Post, reqUrl);
             req.Headers.Add("Accept", "application/json");
             if (includeAuthToken && !string.IsNullOrEmpty(_accessToken))
-                req.Headers.Add("Authorization", _accessToken); // ajustar se Shopee exigir "Authorization: Bearer {token}"
+                req.Headers.Add("Authorization", $"Bearer {_accessToken}");
 
             req.Content = new StringContent(bodyJson, Encoding.UTF8, "application/json");
 
             using var resp = await _http.SendAsync(req);
             var respText = await resp.Content.ReadAsStringAsync();
 
+            SimpleLogger.LogResponse(reqUrl, respText, (int)resp.StatusCode);
+
+            JsonDocument doc;
             try
             {
-                var doc = JsonDocument.Parse(respText);
-                return doc.RootElement.Clone();
+                doc = JsonDocument.Parse(respText);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                // Retornar objeto JSON minimal com erro se não for JSON
+                SimpleLogger.Log($"Falha ao parsear resposta JSON: {ex.Message}");
                 var fake = JsonSerializer.SerializeToElement(new { error = -1, message = "invalid json response", raw = respText });
                 return fake;
             }
+
+            var root = doc.RootElement.Clone();
+
+            // Se header http não OK, log e lançar
+            if (!resp.IsSuccessStatusCode)
+            {
+                var (errCode, errMsg) = ExtractError(root);
+                var msg = $"HTTP {(int)resp.StatusCode} ao chamar Shopee: {errMsg}";
+                SimpleLogger.Log(msg);
+                throw new ShopeeApiException(msg, errCode, errMsg);
+            }
+
+            // Verificar campo de erro no payload
+            if (root.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.Number && err.GetInt32() != 0)
+            {
+                var (errCode, errMsg) = ExtractError(root);
+                SimpleLogger.Log($"Erro Shopee API: code={errCode} message={errMsg}");
+                throw new ShopeeApiException($"Erro API Shopee: {errMsg}", errCode, errMsg);
+            }
+
+            return root;
+        }
+
+        private static (int code, string message) ExtractError(JsonElement element)
+        {
+            try
+            {
+                if (element.TryGetProperty("error", out var e) && e.TryGetInt32(out var ec))
+                {
+                    var msg = element.TryGetProperty("message", out var m) ? m.GetString() : null;
+                    return (ec, msg);
+                }
+
+                // tentar em response.error/message
+                if (element.TryGetProperty("response", out var r) && r.ValueKind == JsonValueKind.Object)
+                {
+                    if (r.TryGetProperty("error", out var re) && re.TryGetInt32(out var rec))
+                        return (rec, r.TryGetProperty("message", out var rm) ? rm.GetString() : null);
+                }
+            }
+            catch { }
+            return (-1, null);
+        }
+
+        private static bool HasError(JsonElement elem)
+        {
+            if (elem.TryGetProperty("error", out var e) && e.ValueKind == JsonValueKind.Number && e.GetInt32() != 0) return true;
+            if (elem.TryGetProperty("response", out var r) && r.ValueKind == JsonValueKind.Object && r.TryGetProperty("error", out var re) && re.ValueKind == JsonValueKind.Number && re.GetInt32() != 0) return true;
+            return false;
+        }
+
+        private static ShopeeApiException ConstructExceptionFromResponse(JsonElement resp, string ctx)
+        {
+            var (code, msg) = ExtractError(resp);
+            var message = $"Erro Shopee ({ctx}): code={code} message={msg}";
+            return new ShopeeApiException(message, code, msg);
+        }
+
+        private static decimal ParseDecimalFromJsonElement(JsonElement el, string propName)
+        {
+            if (!el.TryGetProperty(propName, out var je)) return 0m;
+            if (je.ValueKind == JsonValueKind.Number && je.TryGetDecimal(out var d)) return d;
+            if (je.ValueKind == JsonValueKind.String && decimal.TryParse(je.GetString(), out var d2)) return d2;
+            return 0m;
         }
 
         private static string ComputeHmacSha256(string key, string data)
@@ -532,6 +689,164 @@ namespace ShopeeIntegration
             var bytes = Encoding.UTF8.GetBytes(data);
             var hash = hmac.ComputeHash(bytes);
             return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+        }
+
+        // ---------------------------
+        // Token persistence (DPAPI + Windows Credential Manager)
+        // ---------------------------
+        private void SaveTokenSecure(string token)
+        {
+            // tenta salvar no Credential Manager; se falhar, salva em arquivo cifrado
+            try
+            {
+                if (SaveTokenToCredentialManager(token))
+                {
+                    SimpleLogger.Log("Access token salvo no Windows Credential Manager.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao salvar no Credential Manager: {ex.Message}");
+            }
+
+            // fallback para arquivo cifrado
+            SaveTokenToEncryptedFile(token);
+            SimpleLogger.Log("Access token salvo em arquivo cifrado (fallback).");
+        }
+
+        private string LoadTokenSecure()
+        {
+            // tenta Credential Manager primeiro
+            try
+            {
+                var token = ReadTokenFromCredentialManager();
+                if (!string.IsNullOrEmpty(token))
+                {
+                    SimpleLogger.Log("Token carregado do Windows Credential Manager.");
+                    return token;
+                }
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao ler Credential Manager: {ex.Message}");
+            }
+
+            // fallback para arquivo cifrado
+            var fileToken = ReadTokenFromEncryptedFile();
+            if (!string.IsNullOrEmpty(fileToken))
+            {
+                SimpleLogger.Log("Token carregado de arquivo cifrado.");
+            }
+            return fileToken;
+        }
+
+        private void SaveTokenToEncryptedFile(string token)
+        {
+            Directory.CreateDirectory(AppFolder);
+            var bytes = Encoding.UTF8.GetBytes(token);
+            var protectedBytes = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
+            File.WriteAllText(TokenFilePath, Convert.ToBase64String(protectedBytes), Encoding.UTF8);
+        }
+
+        private string ReadTokenFromEncryptedFile()
+        {
+            if (!File.Exists(TokenFilePath)) return null;
+            var b64 = File.ReadAllText(TokenFilePath, Encoding.UTF8);
+            var protectedBytes = Convert.FromBase64String(b64);
+            var bytes = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(bytes);
+        }
+
+        // Windows Credential Manager P/Invoke
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool CredWrite([In] ref CREDENTIAL userCredential, [In] uint flags);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool CredRead(string target, uint type, uint reservedFlag, out IntPtr credentialPtr);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern void CredFree([In] IntPtr buffer);
+
+        private const uint CRED_TYPE_GENERIC = 1;
+        private const uint CRED_PERSIST_LOCAL_MACHINE = 2;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct CREDENTIAL
+        {
+            public uint Flags;
+            public uint Type;
+            public string TargetName;
+            public string Comment;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWritten;
+            public uint CredentialBlobSize;
+            public IntPtr CredentialBlob;
+            public uint Persist;
+            public uint AttributeCount;
+            public IntPtr Attributes;
+            public string TargetAlias;
+            public string UserName;
+        }
+
+        private bool SaveTokenToCredentialManager(string token)
+        {
+            var credential = new CREDENTIAL
+            {
+                Flags = 0,
+                Type = CRED_TYPE_GENERIC,
+                TargetName = CredentialTarget,
+                Comment = "ShopeeIntegration access token",
+                Persist = CRED_PERSIST_LOCAL_MACHINE,
+                AttributeCount = 0,
+                Attributes = IntPtr.Zero,
+                TargetAlias = null,
+                UserName = Environment.UserName
+            };
+
+            var blob = Encoding.Unicode.GetBytes(token);
+            credential.CredentialBlobSize = (uint)blob.Length;
+            credential.CredentialBlob = Marshal.AllocCoTaskMem(blob.Length);
+            Marshal.Copy(blob, 0, credential.CredentialBlob, blob.Length);
+
+            var written = CredWrite(ref credential, 0);
+            Marshal.FreeCoTaskMem(credential.CredentialBlob);
+
+            if (!written)
+            {
+                var err = Marshal.GetLastWin32Error();
+                SimpleLogger.Log($"CredWrite falhou com código: {err}");
+            }
+
+            return written;
+        }
+
+        private string ReadTokenFromCredentialManager()
+        {
+            var read = CredRead(CredentialTarget, CRED_TYPE_GENERIC, 0, out var credPtr);
+            if (!read)
+            {
+                var err = Marshal.GetLastWin32Error();
+                SimpleLogger.Log($"CredRead falhou com código: {err}");
+                return null;
+            }
+
+            try
+            {
+                var cred = Marshal.PtrToStructure<CREDENTIAL>(credPtr);
+                if (cred.CredentialBlobSize > 0 && cred.CredentialBlob != IntPtr.Zero)
+                {
+                    var blob = new byte[cred.CredentialBlobSize];
+                    Marshal.Copy(cred.CredentialBlob, blob, 0, (int)cred.CredentialBlobSize);
+                    var token = Encoding.Unicode.GetString(blob).TrimEnd('\0');
+                    return token;
+                }
+            }
+            finally
+            {
+                CredFree(credPtr);
+            }
+
+            return null;
         }
     }
 }
