@@ -216,7 +216,7 @@
             btnListOrders.Text = "Listar Pedidos";
             btnListOrders.UseVisualStyleBackColor = true;
             btnListOrders.Click += new System.EventHandler(this.BtnListOrders_Click);
-
+            
             // DataGridView Orders (fills rest of tab)
             dgvOrders.Location = new System.Drawing.Point(6, 39);
             dgvOrders.Name = "dgvOrders";
