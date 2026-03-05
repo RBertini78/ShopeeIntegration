@@ -810,7 +810,7 @@ namespace ShopeeIntegration
                 if (!resp.TryGetProperty("response", out var responseObj))
                     throw ConstructExceptionFromResponse(resp, "GetProductsAsync");
 
-                if (!responseObj.TryGetProperty("items", out var items))
+                if (!responseObj.TryGetProperty("items", out var items) && !responseObj.TryGetProperty("item", out items))
                     break;
 
                 var itemsArray = items.EnumerateArray().ToArray();
