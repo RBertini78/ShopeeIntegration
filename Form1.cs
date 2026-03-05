@@ -83,13 +83,13 @@ namespace ShopeeIntegration
         {
             if (!long.TryParse(txtPartnerId.Text.Trim(), out var partnerId))
             {
-                MessageBox.Show("Partner ID invï¿½lido.");
+                MessageBox.Show("Partner ID inv˜lido.");
                 return;
             }
 
             if (!long.TryParse(txtShopId.Text.Trim(), out var shopId))
             {
-                MessageBox.Show("Shop ID invï¿½lido.");
+                MessageBox.Show("Shop ID inv˜lido.");
                 return;
             }
 
@@ -97,7 +97,7 @@ namespace ShopeeIntegration
             var env = cbEnvironment.SelectedItem?.ToString() ?? "Sandbox";
 
             _service = new ShopeeService(partnerId, shopId, apiKey, env == "Production" ? ShopeeEnvironment.Production : ShopeeEnvironment.Sandbox);
-            SetStatus("Serviï¿½o inicializado.");
+            SetStatus("Servi˜o inicializado.");
         }
 
         private async void BtnListProducts_Click(object sender, EventArgs e)
@@ -148,9 +148,9 @@ namespace ShopeeIntegration
 
             try
             {
-                SetStatus("Atualizando estoque/preï¿½o...");
+                SetStatus("Atualizando estoque/pre˜o...");
                 var ok = await _service.UpdateStockPriceAsync(row.ItemId, newStock, newPrice);
-                SetStatus(ok ? "Atualizado com sucesso." : "Falha na atualizaï¿½ï¿½o.");
+                SetStatus(ok ? "Atualizado com sucesso." : "Falha na atualiza˜˜o.");
                 if (ok) await BtnListProductsReload();
             }
             catch (Exception ex)
@@ -232,7 +232,7 @@ namespace ShopeeIntegration
             var code = txtAuthCode.Text.Trim();
             if (string.IsNullOrEmpty(code))
             {
-                MessageBox.Show("Informe o authorization_code obtido apï¿½s autorizaï¿½ï¿½o.");
+                MessageBox.Show("Informe o authorization_code obtido ap˜s autoriza˜˜o.");
                 return;
             }
 
@@ -728,7 +728,11 @@ namespace ShopeeIntegration
                 signInputBuilder.Append(bodyJson);
                 signInput = signInputBuilder.ToString();
             }
-            var sign = ShopeeCrypto.ComputeHmacSha256PartnerKey(_apiKey, signInput);
+
+            // Auth endpoints: use partner key as raw UTF-8 (Sandbox/API expect literal key string, not hex-decoded "shpk" payload)
+            string sign = (isAuthTokenGet || isAuthAccessTokenGet)
+                ? ShopeeCrypto.ComputeHmacSha256(_apiKey, signInput)
+                : ShopeeCrypto.ComputeHmacSha256PartnerKey(_apiKey, signInput);
 
             var qs = new List<string>
             {
@@ -946,7 +950,7 @@ namespace ShopeeIntegration
             if (!written)
             {
                 var err = Marshal.GetLastWin32Error();
-                SimpleLogger.Log($"CredWrite falhou com cï¿½digo: {err}");
+                SimpleLogger.Log($"CredWrite falhou com c˜digo: {err}");
             }
 
             return written;
@@ -958,7 +962,7 @@ namespace ShopeeIntegration
             if (!read)
             {
                 var err = Marshal.GetLastWin32Error();
-                SimpleLogger.Log($"CredRead falhou com cï¿½digo: {err}");
+                SimpleLogger.Log($"CredRead falhou com c˜digo: {err}");
                 return null;
             }
 
