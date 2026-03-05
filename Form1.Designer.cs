@@ -1,4 +1,4 @@
-﻿namespace ShopeeIntegration
+namespace ShopeeIntegration
 {
     partial class Form1
     {
@@ -24,6 +24,7 @@
         private System.Windows.Forms.Button btnGetAuthUrl;
         private System.Windows.Forms.TextBox txtAuthCode;
         private System.Windows.Forms.Button btnGetToken;
+        private System.Windows.Forms.Button btnRefreshToken;
         private System.Windows.Forms.Label lblAuthCode;
 
         // New controls for tabs
@@ -144,9 +145,17 @@
             btnGetToken.Location = new System.Drawing.Point(575, 75);
             btnGetToken.Name = "btnGetToken";
             btnGetToken.Size = new System.Drawing.Size(110, 27);
-            btnGetToken.Text = "Trocar Token";
+            btnGetToken.Text = "Get Access Token";
             btnGetToken.UseVisualStyleBackColor = true;
             btnGetToken.Click += new System.EventHandler(this.BtnGetToken_Click);
+
+            btnRefreshToken = new System.Windows.Forms.Button();
+            btnRefreshToken.Location = new System.Drawing.Point(691, 75);
+            btnRefreshToken.Name = "btnRefreshToken";
+            btnRefreshToken.Size = new System.Drawing.Size(94, 27);
+            btnRefreshToken.Text = "Refresh Token";
+            btnRefreshToken.UseVisualStyleBackColor = true;
+            btnRefreshToken.Click += new System.EventHandler(this.BtnRefreshToken_Click);
 
             // TabControl
             tabControlMain.Location = new System.Drawing.Point(12, 110);
@@ -267,6 +276,7 @@
             Controls.Add(lblAuthCode);
             Controls.Add(txtAuthCode);
             Controls.Add(btnGetToken);
+            Controls.Add(btnRefreshToken);
             Controls.Add(tabControlMain);
             Controls.Add(statusStrip);
             Name = "Form1";

@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -15,6 +16,11 @@ namespace ShopeeIntegration
     public partial class Form1 : Form
     {
         private ShopeeService _service;
+
+        private const int AuthCallbackPort = 8765;
+        private static readonly string AuthRedirectUri = $"http://127.0.0.1:{AuthCallbackPort}/callback";
+        private const int AuthCallbackTimeoutSeconds = 300; // 5 minutes
+
         private static readonly string CredentialsFilePath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ShopeeIntegration", "credentials.json");
@@ -188,7 +194,76 @@ namespace ShopeeIntegration
             }
         }
 
-        private void BtnGetAuthUrl_Click(object sender, EventArgs e)
+        private static async Task<(string code, string errorMessage)> WaitForAuthCallbackAsync()
+        {
+            var listener = new HttpListener();
+            listener.Prefixes.Add($"http://127.0.0.1:{AuthCallbackPort}/");
+            listener.Start();
+            try
+            {
+                var timeoutTask = Task.Delay(TimeSpan.FromSeconds(AuthCallbackTimeoutSeconds));
+                var contextTask = listener.GetContextAsync();
+                var completed = await Task.WhenAny(contextTask, timeoutTask).ConfigureAwait(false);
+                if (completed != contextTask)
+                {
+                    return (null, "Tempo esgotado. Tente novamente ou cole o code manualmente.");
+                }
+
+                var context = await contextTask.ConfigureAwait(false);
+                var request = context.Request;
+                var query = request.Url?.Query?.TrimStart('?') ?? "";
+                var parsed = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var part in query.Split(new[] { '&' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var idx = part.IndexOf('=');
+                    if (idx < 0) continue;
+                    var key = Uri.UnescapeDataString(part.Substring(0, idx));
+                    var value = Uri.UnescapeDataString(part.Substring(idx + 1));
+                    parsed[key] = value;
+                }
+                parsed.TryGetValue("code", out var code);
+                parsed.TryGetValue("error", out var error);
+                parsed.TryGetValue("error_description", out var errorDesc);
+                if (string.IsNullOrEmpty(errorDesc)) parsed.TryGetValue("message", out errorDesc);
+
+                const string successHtml = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Autoriza??o</title></head><body><p>Autoriza??o conclu?da. Voc? pode fechar esta janela.</p></body></html>";
+                const string errorHtml = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Erro</title></head><body><p>Autoriza??o negada ou erro. Feche esta janela e tente novamente.</p></body></html>";
+
+                var response = context.Response;
+                response.ContentType = "text/html; charset=utf-8";
+                response.ContentEncoding = Encoding.UTF8;
+
+                if (!string.IsNullOrEmpty(error))
+                {
+                    var body = Encoding.UTF8.GetBytes(errorHtml);
+                    response.ContentLength64 = body.Length;
+                    await response.OutputStream.WriteAsync(body, 0, body.Length).ConfigureAwait(false);
+                    response.OutputStream.Close();
+                    return (null, string.IsNullOrEmpty(errorDesc) ? "Autoriza??o negada ou erro." : errorDesc);
+                }
+
+                if (string.IsNullOrEmpty(code))
+                {
+                    var body = Encoding.UTF8.GetBytes(errorHtml);
+                    response.ContentLength64 = body.Length;
+                    await response.OutputStream.WriteAsync(body, 0, body.Length).ConfigureAwait(false);
+                    response.OutputStream.Close();
+                    return (null, "Nenhum code recebido na URL.");
+                }
+
+                var successBody = Encoding.UTF8.GetBytes(successHtml);
+                response.ContentLength64 = successBody.Length;
+                await response.OutputStream.WriteAsync(successBody, 0, successBody.Length).ConfigureAwait(false);
+                response.OutputStream.Close();
+                return (code, null);
+            }
+            finally
+            {
+                try { listener.Stop(); } catch { /* ignore */ }
+            }
+        }
+
+        private async void BtnGetAuthUrl_Click(object sender, EventArgs e)
         {
             if (_service == null)
             {
@@ -196,28 +271,82 @@ namespace ShopeeIntegration
                 return;
             }
 
-            // Ajuste o redirectUri para o registrado na Shopee (exact match)
-            var redirectUri = "https://open.shopee.com"; // substituir pelo seu redirect URI registrado
+            var redirectUri = AuthRedirectUri;
 
-            // Gera candidatos e abre a primeira (apenas para facilitar testes)
             var candidates = _service.GetAuthorizationUrlCandidates(redirectUri);
-
-            if (candidates.Count > 0)
-            {
-                // Copia para clipboard e abre o navegador
-                try
-                {
-                    Clipboard.SetText(candidates[0].Url);
-                }
-                catch { /* ignore clipboard failures */ }
-
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = candidates[0].Url, UseShellExecute = true });
-
-                SimpleLogger.Log($"Opened auth URL candidate 0. SignInputMasked: {candidates[0].SignInputMasked}, Sign: {candidates[0].Sign}");                
-            }
-            else
+            if (candidates.Count == 0)
             {
                 MessageBox.Show("Nenhuma URL candidata gerada (verifique partner_id/api_key).");
+                return;
+            }
+
+            try
+            {
+                SetStatus("Aguardando autoriza??o no navegador...");
+                try { Clipboard.SetText(candidates[0].Url); } catch { }
+
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo { FileName = candidates[0].Url, UseShellExecute = true });
+                SimpleLogger.Log($"Opened auth URL with redirect {redirectUri}");
+
+                var (code, errorMessage) = await WaitForAuthCallbackAsync().ConfigureAwait(false);
+
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() =>
+                    {
+                        if (!string.IsNullOrEmpty(errorMessage))
+                        {
+                            SetStatus("Falha na captura do code.");
+                            MessageBox.Show(errorMessage);
+                            return;
+                        }
+                        txtAuthCode.Text = code;
+                        SetStatus("Code recebido. Obtendo access token...");
+                    }));
+                }
+
+                if (!string.IsNullOrEmpty(errorMessage))
+                {
+                    SetStatus("Falha na captura do code.");
+                    if (!InvokeRequired) MessageBox.Show(errorMessage);
+                    return;
+                }
+
+                string codeToUse = null;
+                if (InvokeRequired)
+                    codeToUse = (string)Invoke(new Func<string>(() => txtAuthCode.Text.Trim()));
+                else
+                    codeToUse = txtAuthCode.Text.Trim();
+
+                var token = await _service.GetAccessTokenAsync(codeToUse).ConfigureAwait(false);
+                if (InvokeRequired)
+                {
+                    Invoke(new Action(() =>
+                    {
+                        SetStatus("Token obtido e armazenado (seguro).");
+                        MessageBox.Show("Access token obtido com sucesso.");
+                    }));
+                }
+                else
+                {
+                    SetStatus("Token obtido e armazenado (seguro).");
+                    MessageBox.Show("Access token obtido com sucesso.");
+                }
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"BtnGetAuthUrl error: {ex.Message}");
+                if (InvokeRequired)
+                    Invoke(new Action(() =>
+                    {
+                        SetStatus("Erro ao obter token.");
+                        MessageBox.Show("Erro: " + ex.Message);
+                    }));
+                else
+                {
+                    SetStatus("Erro ao obter token.");
+                    MessageBox.Show("Erro: " + ex.Message);
+                }
             }
         }
 
@@ -238,7 +367,7 @@ namespace ShopeeIntegration
 
             try
             {
-                SetStatus("Trocando authorization_code por access_token...");
+                SetStatus("Obtendo access token...");
                 var token = await _service.GetAccessTokenAsync(code);
                 if (!string.IsNullOrEmpty(token))
                 {
@@ -255,6 +384,28 @@ namespace ShopeeIntegration
             {
                 MessageBox.Show("Erro ao obter token: " + ex.Message);
                 SetStatus("Erro ao obter token.");
+            }
+        }
+
+        private async void BtnRefreshToken_Click(object sender, EventArgs e)
+        {
+            if (_service == null)
+            {
+                MessageBox.Show("Conecte primeiro (clique em Conectar).");
+                return;
+            }
+
+            try
+            {
+                SetStatus("Renovando access token...");
+                await _service.RefreshTokenFromStoredAsync();
+                SetStatus("Token renovado e salvo.");
+                MessageBox.Show("Access token renovado com sucesso.");
+            }
+            catch (Exception ex)
+            {
+                SetStatus("Falha ao renovar token.");
+                MessageBox.Show("Erro ao renovar token: " + ex.Message);
             }
         }
     }
@@ -369,9 +520,13 @@ namespace ShopeeIntegration
 
         private static readonly string AppFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ShopeeIntegration");
         private static readonly string TokenFilePath = Path.Combine(AppFolder, "access_token.dat");
+        private static readonly string RefreshTokenFilePath = Path.Combine(AppFolder, "refresh_token.dat");
+        private static readonly string TokenExpiresAtFilePath = Path.Combine(AppFolder, "token_expires_at.dat");
         private const string CredentialTarget = "ShopeeIntegration_AccessToken";
+        private const string CredentialTargetRefreshToken = "ShopeeIntegration_RefreshToken";
 
         private string _accessToken = null;
+        private string _refreshToken = null;
         private DateTime? _accessTokenExpiresAt = null;
 
         public ShopeeService(long partnerId, long shopId, string apiKey, ShopeeEnvironment env)
@@ -395,6 +550,31 @@ namespace ShopeeIntegration
             catch (Exception ex)
             {
                 SimpleLogger.Log($"Falha ao carregar token seguro: {ex.Message}");
+            }
+
+            try
+            {
+                var refresh = LoadRefreshTokenSecure();
+                if (!string.IsNullOrEmpty(refresh))
+                {
+                    _refreshToken = refresh;
+                    SimpleLogger.Log("Refresh token carregado do armazenamento seguro.");
+                }
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao carregar refresh token: {ex.Message}");
+            }
+
+            try
+            {
+                var expiresAt = LoadTokenExpiresAt();
+                if (expiresAt.HasValue)
+                    _accessTokenExpiresAt = expiresAt;
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao carregar expira??o do token: {ex.Message}");
             }
         }
 
@@ -479,6 +659,8 @@ namespace ShopeeIntegration
                 _accessToken = tok.GetString();
                 if (resp.TryGetProperty("expires_in", out var exp) && exp.TryGetInt32(out var seconds))
                     _accessTokenExpiresAt = DateTime.UtcNow.AddSeconds(seconds - 30);
+                if (resp.TryGetProperty("refresh_token", out var refTok))
+                    _refreshToken = refTok.GetString();
 
                 try
                 {
@@ -488,6 +670,27 @@ namespace ShopeeIntegration
                 catch (Exception ex)
                 {
                     SimpleLogger.Log($"Falha ao salvar token seguro: {ex.Message}");
+                }
+                try
+                {
+                    if (!string.IsNullOrEmpty(_refreshToken))
+                    {
+                        SaveRefreshTokenSecure(_refreshToken);
+                        SimpleLogger.Log("Refresh token salvo de forma segura.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SimpleLogger.Log($"Falha ao salvar refresh token: {ex.Message}");
+                }
+                try
+                {
+                    if (_accessTokenExpiresAt.HasValue)
+                        SaveTokenExpiresAt(_accessTokenExpiresAt);
+                }
+                catch (Exception ex)
+                {
+                    SimpleLogger.Log($"Falha ao salvar expira??o do token: {ex.Message}");
                 }
 
                 return _accessToken;
@@ -517,6 +720,8 @@ namespace ShopeeIntegration
                 _accessToken = tok.GetString();
                 if (resp.TryGetProperty("expires_in", out var exp) && exp.TryGetInt32(out var seconds))
                     _accessTokenExpiresAt = DateTime.UtcNow.AddSeconds(seconds - 30);
+                if (resp.TryGetProperty("refresh_token", out var refTok))
+                    _refreshToken = refTok.GetString();
 
                 try
                 {
@@ -527,12 +732,62 @@ namespace ShopeeIntegration
                 {
                     SimpleLogger.Log($"Falha ao salvar token seguro ap?s refresh: {ex.Message}");
                 }
+                try
+                {
+                    if (!string.IsNullOrEmpty(_refreshToken))
+                    {
+                        SaveRefreshTokenSecure(_refreshToken);
+                        SimpleLogger.Log("Refresh token atualizado e salvo.");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    SimpleLogger.Log($"Falha ao salvar refresh token ap?s refresh: {ex.Message}");
+                }
+                try
+                {
+                    if (_accessTokenExpiresAt.HasValue)
+                        SaveTokenExpiresAt(_accessTokenExpiresAt);
+                }
+                catch (Exception ex)
+                {
+                    SimpleLogger.Log($"Falha ao salvar expira??o ap?s refresh: {ex.Message}");
+                }
 
                 return _accessToken;
             }
 
             var (code, msg) = ExtractError(resp);
             throw new ShopeeApiException("Falha ao renovar access_token (refresh)", code, msg);
+        }
+
+        /// <summary>Refresh access token using the stored refresh_token.</summary>
+        public async Task<string> RefreshTokenFromStoredAsync()
+        {
+            var refresh = _refreshToken;
+            if (string.IsNullOrWhiteSpace(refresh))
+                refresh = LoadRefreshTokenSecure();
+            if (string.IsNullOrWhiteSpace(refresh))
+                throw new ShopeeApiException("Refresh token n?o encontrado. Fa?a login novamente (Gerar Auth URL) para obter um novo token.", -1, null);
+            return await RefreshTokenAsync(refresh).ConfigureAwait(false);
+        }
+
+        /// <summary>Ensures access token is valid; if expired, refreshes it using stored refresh_token.</summary>
+        private async Task EnsureValidAccessTokenAsync()
+        {
+            if (string.IsNullOrEmpty(_accessToken)) return;
+            if (_accessTokenExpiresAt.HasValue && DateTime.UtcNow >= _accessTokenExpiresAt.Value)
+            {
+                try
+                {
+                    await RefreshTokenFromStoredAsync().ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    SimpleLogger.Log($"EnsureValidAccessToken: falha ao renovar token: {ex.Message}");
+                    throw;
+                }
+            }
         }
 
         public async Task<List<ProductModel>> GetProductsAsync()
@@ -691,6 +946,8 @@ namespace ShopeeIntegration
 
         private async Task<JsonElement> SendPostAsync(string path, object bodyObj, bool includeShopId = false, bool includeAuthToken = true)
         {
+            if (includeAuthToken)
+                await EnsureValidAccessTokenAsync().ConfigureAwait(false);
             var urlPath = path.StartsWith("/") ? path : "/" + path;
             var host = ApiBaseHost;
             var url = host + urlPath;
@@ -783,6 +1040,7 @@ namespace ShopeeIntegration
         /// <summary>GET request for V2 APIs that use sign = partner_id + path + timestamp + access_token + shop_id (e.g. get_item_list).</summary>
         private async Task<JsonElement> SendGetAsync(string path, IReadOnlyDictionary<string, string> queryParams)
         {
+            await EnsureValidAccessTokenAsync().ConfigureAwait(false);
             if (string.IsNullOrEmpty(_accessToken))
                 throw new ShopeeApiException("Access token is required for this API call.");
 
@@ -952,6 +1210,123 @@ namespace ShopeeIntegration
             var protectedBytes = Convert.FromBase64String(b64);
             var bytes = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
             return Encoding.UTF8.GetString(bytes);
+        }
+
+        private void SaveRefreshTokenSecure(string refreshToken)
+        {
+            if (string.IsNullOrEmpty(refreshToken)) return;
+            try
+            {
+                if (SaveRefreshTokenToCredentialManager(refreshToken))
+                {
+                    SimpleLogger.Log("Refresh token salvo no Windows Credential Manager.");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao salvar refresh token no Credential Manager: {ex.Message}");
+            }
+            SaveRefreshTokenToEncryptedFile(refreshToken);
+            SimpleLogger.Log("Refresh token salvo em arquivo cifrado (fallback).");
+        }
+
+        private string LoadRefreshTokenSecure()
+        {
+            try
+            {
+                var token = ReadRefreshTokenFromCredentialManager();
+                if (!string.IsNullOrEmpty(token))
+                    return token;
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao ler refresh token do Credential Manager: {ex.Message}");
+            }
+            return ReadRefreshTokenFromEncryptedFile();
+        }
+
+        private void SaveRefreshTokenToEncryptedFile(string token)
+        {
+            Directory.CreateDirectory(AppFolder);
+            var bytes = Encoding.UTF8.GetBytes(token);
+            var protectedBytes = ProtectedData.Protect(bytes, null, DataProtectionScope.CurrentUser);
+            File.WriteAllText(RefreshTokenFilePath, Convert.ToBase64String(protectedBytes), Encoding.UTF8);
+        }
+
+        private string ReadRefreshTokenFromEncryptedFile()
+        {
+            if (!File.Exists(RefreshTokenFilePath)) return null;
+            var b64 = File.ReadAllText(RefreshTokenFilePath, Encoding.UTF8);
+            var protectedBytes = Convert.FromBase64String(b64);
+            var bytes = ProtectedData.Unprotect(protectedBytes, null, DataProtectionScope.CurrentUser);
+            return Encoding.UTF8.GetString(bytes);
+        }
+
+        private bool SaveRefreshTokenToCredentialManager(string token)
+        {
+            var credential = new CREDENTIAL
+            {
+                Flags = 0,
+                Type = CRED_TYPE_GENERIC,
+                TargetName = CredentialTargetRefreshToken,
+                Comment = "ShopeeIntegration refresh token",
+                Persist = CRED_PERSIST_LOCAL_MACHINE,
+                AttributeCount = 0,
+                Attributes = IntPtr.Zero,
+                TargetAlias = null,
+                UserName = Environment.UserName
+            };
+            var blob = Encoding.Unicode.GetBytes(token);
+            credential.CredentialBlobSize = (uint)blob.Length;
+            credential.CredentialBlob = Marshal.AllocCoTaskMem(blob.Length);
+            Marshal.Copy(blob, 0, credential.CredentialBlob, blob.Length);
+            var written = CredWrite(ref credential, 0);
+            Marshal.FreeCoTaskMem(credential.CredentialBlob);
+            if (!written)
+            {
+                var err = Marshal.GetLastWin32Error();
+                SimpleLogger.Log($"CredWrite (refresh) falhou com c?digo: {err}");
+            }
+            return written;
+        }
+
+        private string ReadRefreshTokenFromCredentialManager()
+        {
+            var read = CredRead(CredentialTargetRefreshToken, CRED_TYPE_GENERIC, 0, out var credPtr);
+            if (!read) return null;
+            try
+            {
+                var cred = Marshal.PtrToStructure<CREDENTIAL>(credPtr);
+                if (cred.CredentialBlobSize > 0 && cred.CredentialBlob != IntPtr.Zero)
+                {
+                    var blob = new byte[cred.CredentialBlobSize];
+                    Marshal.Copy(cred.CredentialBlob, blob, 0, (int)cred.CredentialBlobSize);
+                    return Encoding.Unicode.GetString(blob).TrimEnd('\0');
+                }
+            }
+            finally
+            {
+                CredFree(credPtr);
+            }
+            return null;
+        }
+
+        private void SaveTokenExpiresAt(DateTime? expiresAtUtc)
+        {
+            if (!expiresAtUtc.HasValue) return;
+            Directory.CreateDirectory(AppFolder);
+            File.WriteAllText(TokenExpiresAtFilePath, expiresAtUtc.Value.ToUniversalTime().Ticks.ToString(), Encoding.UTF8);
+        }
+
+        private DateTime? LoadTokenExpiresAt()
+        {
+            if (!File.Exists(TokenExpiresAtFilePath)) return null;
+            var s = File.ReadAllText(TokenExpiresAtFilePath, Encoding.UTF8).Trim();
+            if (string.IsNullOrEmpty(s)) return null;
+            if (long.TryParse(s, out var ticks))
+                return new DateTime(ticks, DateTimeKind.Utc);
+            return null;
         }
 
         // Windows Credential Manager P/Invoke
