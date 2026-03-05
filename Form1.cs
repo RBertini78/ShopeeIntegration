@@ -538,21 +538,20 @@ namespace ShopeeIntegration
         public async Task<List<ProductModel>> GetProductsAsync()
         {
             var result = new List<ProductModel>();
-            var page = 1;
-            var pageSize = 50;
+            var offset = 0;
+            const int pageSize = 100;
+            var path = "/api/v2/product/get_item_list";
 
             while (true)
             {
-                var path = "/api/v2/product/get_item_list";
-                var body = new
+                var queryParams = new Dictionary<string, string>
                 {
-                    partner_id = _partnerId,
-                    shop_id = _shopId,
-                    page_size = pageSize,
-                    page_no = page
+                    ["offset"] = offset.ToString(),
+                    ["page_size"] = pageSize.ToString(),
+                    ["item_status"] = "NORMAL"
                 };
 
-                var resp = await SendPostAsync(path, body, includeShopId: true);
+                var resp = await SendGetAsync(path, queryParams);
                 if (!resp.TryGetProperty("response", out var responseObj))
                     throw ConstructExceptionFromResponse(resp, "GetProductsAsync");
 
@@ -579,7 +578,7 @@ namespace ShopeeIntegration
                 }
 
                 if (itemsArray.Length < pageSize) break;
-                page++;
+                offset += pageSize;
             }
 
             return result;
@@ -617,44 +616,61 @@ namespace ShopeeIntegration
         public async Task<List<OrderModel>> GetOrdersAsync()
         {
             var orders = new List<OrderModel>();
-            var page = 1;
-            var pageSize = 50;
+            var path = "/api/v2/order/get_order_list";
+            var timeTo = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var timeFrom = DateTimeOffset.UtcNow.AddDays(-14).ToUnixTimeSeconds();
 
-            while (true)
+            var queryParams = new Dictionary<string, string>
             {
-                var path = "/api/v2/orders/get_order_list";
-                var body = new
+                ["time_range_field"] = "create_time",
+                ["time_to"] = timeTo.ToString(),
+                ["time_from"] = timeFrom.ToString(),
+                ["page_size"] = "100"
+            };
+
+            var resp = await SendGetAsync(path, queryParams);
+            if (!resp.TryGetProperty("response", out var responseObj))
+                throw ConstructExceptionFromResponse(resp, "GetOrdersAsync");
+
+            if (!responseObj.TryGetProperty("order_list", out var arr) && !responseObj.TryGetProperty("orders", out arr))
+                return orders;
+
+            var arrItems = arr.EnumerateArray().ToArray();
+            foreach (var o in arrItems)
+            {
+                var orderId = o.TryGetProperty("order_sn", out var osn) ? osn.GetString() :
+                              (o.TryGetProperty("order_id", out var oid) ? oid.GetString() : "");
+                var buyer = o.TryGetProperty("buyer_username", out var bn) ? bn.GetString() : "";
+                var total = o.TryGetProperty("total_amount", out var ta) ? (ta.TryGetDecimal(out var d) ? d : 0m) : 0m;
+
+                var order = new OrderModel
                 {
-                    partner_id = _partnerId,
-                    shop_id = _shopId,
-                    page_size = pageSize,
-                    page_no = page
+                    OrderId = orderId,
+                    BuyerName = buyer,
+                    TotalPrice = total
                 };
 
-                var resp = await SendPostAsync(path, body, includeShopId: true);
-                if (!resp.TryGetProperty("response", out var responseObj)) throw ConstructExceptionFromResponse(resp, "GetOrdersAsync");
-                if (!responseObj.TryGetProperty("orders", out var arr)) break;
-
-                var arrItems = arr.EnumerateArray().ToArray();
-                if (arrItems.Length == 0) break;
-
-                foreach (var o in arrItems)
+                if (o.TryGetProperty("order_lines", out var olines))
                 {
-                    var orderId = o.TryGetProperty("order_sn", out var osn) ? osn.GetString() :
-                                  (o.TryGetProperty("order_id", out var oid) ? oid.GetString() : "");
-                    var buyer = o.TryGetProperty("buyer_username", out var bn) ? bn.GetString() : "";
-                    var total = o.TryGetProperty("total_amount", out var ta) ? (ta.TryGetDecimal(out var d) ? d : 0m) : 0m;
-
-                    var order = new OrderModel
+                    foreach (var li in olines.EnumerateArray())
                     {
-                        OrderId = orderId,
-                        BuyerName = buyer,
-                        TotalPrice = total
-                    };
-
-                    if (o.TryGetProperty("order_lines", out var olines))
+                        order.Items.Add(new OrderItemModel
+                        {
+                            ItemId = li.TryGetProperty("item_id", out var iid) ? iid.GetInt64() : 0,
+                            Name = li.TryGetProperty("item_name", out var iname) ? iname.GetString() : "",
+                            Quantity = li.TryGetProperty("item_quantity", out var iq) ? iq.GetInt32() : 0,
+                            Price = li.TryGetProperty("item_price", out var ip) && ip.TryGetDecimal(out var ipd) ? ipd : 0m
+                        });
+                    }
+                }
+                else if (!string.IsNullOrEmpty(orderId))
+                {
+                    var detailPath = "/api/v2/order/get_order_detail";
+                    var detailParams = new Dictionary<string, string> { ["order_sn_list"] = orderId };
+                    var detailResp = await SendGetAsync(detailPath, detailParams);
+                    if (detailResp.TryGetProperty("response", out var detailRespObj) && detailRespObj.TryGetProperty("order_lines", out var detLines))
                     {
-                        foreach (var li in olines.EnumerateArray())
+                        foreach (var li in detLines.EnumerateArray())
                         {
                             order.Items.Add(new OrderItemModel
                             {
@@ -665,36 +681,9 @@ namespace ShopeeIntegration
                             });
                         }
                     }
-                    else
-                    {
-                        var detailPath = "/api/v2/orders/get_order_detail";
-                        var detailBody = new
-                        {
-                            partner_id = _partnerId,
-                            shop_id = _shopId,
-                            order_sn = orderId
-                        };
-                        var detailResp = await SendPostAsync(detailPath, detailBody, includeShopId: true);
-                        if (detailResp.TryGetProperty("response", out var detailRespObj) && detailRespObj.TryGetProperty("order_lines", out var detLines))
-                        {
-                            foreach (var li in detLines.EnumerateArray())
-                            {
-                                order.Items.Add(new OrderItemModel
-                                {
-                                    ItemId = li.TryGetProperty("item_id", out var iid) ? iid.GetInt64() : 0,
-                                    Name = li.TryGetProperty("item_name", out var iname) ? iname.GetString() : "",
-                                    Quantity = li.TryGetProperty("item_quantity", out var iq) ? iq.GetInt32() : 0,
-                                    Price = li.TryGetProperty("item_price", out var ip) && ip.TryGetDecimal(out var ipd) ? ipd : 0m
-                                });
-                            }
-                        }
-                    }
-
-                    orders.Add(order);
                 }
 
-                if (arrItems.Length < pageSize) break;
-                page++;
+                orders.Add(order);
             }
 
             return orders;
@@ -757,6 +746,77 @@ namespace ShopeeIntegration
             using var resp = await _http.SendAsync(req);
             var respText = await resp.Content.ReadAsStringAsync();
 
+            SimpleLogger.LogResponse(reqUrl, respText, (int)resp.StatusCode);
+
+            JsonDocument doc;
+            try
+            {
+                doc = JsonDocument.Parse(respText);
+            }
+            catch (Exception ex)
+            {
+                SimpleLogger.Log($"Falha ao parsear resposta JSON: {ex.Message}");
+                var fake = JsonSerializer.SerializeToElement(new { error = -1, message = "invalid json response", raw = respText });
+                return fake;
+            }
+
+            var root = doc.RootElement.Clone();
+
+            if (!resp.IsSuccessStatusCode)
+            {
+                var (errCode, errMsg) = ExtractError(root);
+                var msg = $"HTTP {(int)resp.StatusCode} ao chamar Shopee: {errMsg}";
+                SimpleLogger.Log(msg);
+                throw new ShopeeApiException(msg, errCode, errMsg);
+            }
+
+            if (root.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.Number && err.GetInt32() != 0)
+            {
+                var (errCode, errMsg) = ExtractError(root);
+                SimpleLogger.Log($"Erro Shopee API: code={errCode} message={errMsg}");
+                throw new ShopeeApiException($"Erro API Shopee: {errMsg}", errCode, errMsg);
+            }
+
+            return root;
+        }
+
+        /// <summary>GET request for V2 APIs that use sign = partner_id + path + timestamp + access_token + shop_id (e.g. get_item_list).</summary>
+        private async Task<JsonElement> SendGetAsync(string path, IReadOnlyDictionary<string, string> queryParams)
+        {
+            if (string.IsNullOrEmpty(_accessToken))
+                throw new ShopeeApiException("Access token is required for this API call.");
+
+            var urlPath = path.StartsWith("/") ? path : "/" + path;
+            var host = ApiBaseHost;
+            var url = host + urlPath;
+            var timestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+            var signInput = $"{_partnerId}{urlPath}{timestamp}{_accessToken}{_shopId}";
+            // Use raw UTF-8 key (same as auth endpoints) so Sandbox accepts the sign; Production may accept either
+            var sign = ShopeeCrypto.ComputeHmacSha256(_apiKey, signInput);
+
+            var qs = new List<string>
+            {
+                $"partner_id={_partnerId}",
+                $"timestamp={timestamp}",
+                $"sign={Uri.EscapeDataString(sign)}",
+                $"shop_id={_shopId}",
+                $"access_token={Uri.EscapeDataString(_accessToken)}"
+            };
+            if (queryParams != null)
+            {
+                foreach (var kv in queryParams)
+                    qs.Add($"{Uri.EscapeDataString(kv.Key)}={Uri.EscapeDataString(kv.Value ?? "")}");
+            }
+
+            var reqUrl = url + "?" + string.Join("&", qs);
+            SimpleLogger.LogRequest(reqUrl, "");
+
+            using var req = new HttpRequestMessage(HttpMethod.Get, reqUrl);
+            req.Headers.Add("Accept", "application/json");
+
+            using var resp = await _http.SendAsync(req);
+            var respText = await resp.Content.ReadAsStringAsync();
             SimpleLogger.LogResponse(reqUrl, respText, (int)resp.StatusCode);
 
             JsonDocument doc;
